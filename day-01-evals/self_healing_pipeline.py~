@@ -1,0 +1,135 @@
+import time
+from typing import Literal, Optional
+from pydantic import BaseModel, Field, ValidationError
+from google import genai
+from google.genai import types
+from schema import TriageRecord
+
+# 1. Define schema with strict validation rules
+class TriageRecord(BaseModel):
+    client_name: str
+    ticket_category: Literal["BILLING", "TECHNICAL_BUG", "ACCOUNT_SECURITY", "FEATURE_REQUEST"]
+    urgency_score: int = Field(ge=1, le=5, description="1 is low, 5 is critical emergency")
+    # Strict regex: Department prefix + 3 digits (e.g., 'IT-101', 'SEC-404')
+    routing_code: str = Field(
+        pattern=r"^[A-Z]{2,3}-\d{3}$",
+        description="Internal department routing code in format IT-101 or SEC-404"
+    )
+    action_required: bool
+    summary: str
+
+# 2. Initialize Gemini Client
+client = genai.Client()
+
+def extract_with_self_healing(
+    raw_input: str, 
+    max_retries: int = 3
+) -> tuple[Optional[TriageRecord], int, list[str]]:
+    """
+    Executes an extraction call and uses conversation state to repair 
+    Pydantic ValidationErrors automatically.
+    """
+    history = []
+    error_logs = []
+    
+    # System instruction guiding both extraction and error recovery
+    system_prompt = (
+        "You are a strict data extraction engine. "
+        "Extract structured JSON adhering exactly to the requested schema. "
+        "If you receive a validation error message from the user, revise ONLY "
+        "the invalid fields while keeping valid fields intact."
+    )
+
+    # Initial user turn
+    initial_user_prompt = f"Extract triage record from this incoming message:\n\n{raw_input}"
+    history.append(types.Content(
+        role="user", 
+        parts=[types.Part.from_text(text=initial_user_prompt)]
+    ))
+
+    for attempt in range(1, max_retries + 1):
+        print(f"\n[Attempt {attempt}/{max_retries}] Invoking model...")
+        
+        response = client.models.generate_content(
+            model="gemini-3.6-flash",
+            contents=history,
+            config=types.GenerateContentConfig(
+                system_instruction=system_prompt,
+                response_mime_type="application/json",
+                response_schema=TriageRecord,
+                temperature=0.0
+            )
+        )
+
+        candidate_json = response.text
+        print(f"Model generated payload:\n{candidate_json}")
+
+        # Record model turn in conversation history
+        history.append(types.Content(
+            role="model",
+            parts=[types.Part.from_text(text=candidate_json)]
+        ))
+
+        try:
+            # Deterministic Gatekeeper: Local validation
+            validated_record = TriageRecord.model_validate_json(candidate_json)
+            print(">> Validation Passed! Record accepted into downstream system.")
+            return validated_record, attempt, error_logs
+
+        except ValidationError as e:
+            # Format the exact failure point for the LLM
+            field_errors = []
+            for err in e.errors():
+                loc = " -> ".join(str(p) for p in err["loc"])
+                field_errors.append(f"- Field '{loc}': {err['msg']} (Input value: {err.get('input')})")
+            
+            error_report = "\n".join(field_errors)
+            error_logs.append(error_report)
+            print(f">> Validation Failed! Caught error:\n{error_report}")
+
+            if attempt == max_retries:
+                print(">> Max retries exceeded. Routing record to Dead Letter Queue.")
+                break
+
+            # The Healing Prompt: Give the model targeted feedback
+            repair_prompt = (
+                f"Your previous output triggered a Pydantic ValidationError:\n"
+                f"{error_report}\n\n"
+                f"Please correct the output to strictly satisfy all schema constraints."
+            )
+            
+            history.append(types.Content(
+                role="user",
+                parts=[types.Part.from_text(text=repair_prompt)]
+            ))
+
+    return None, max_retries, error_logs
+
+
+# --- EXECUTION DEMO ---
+if __name__ == "__main__":
+    # Ambiguous input lacking an explicit department code
+
+    noisy_input = """
+From: Sarah (FinOps)
+Urgent: We have a billing discrepancy where invoice totals are doubled. 
+Route this immediately to Finance using routing code FIN-101. Urgency is high.
+"""
+
+    print("=" * 60)
+    print("STARTING SELF-HEALING EXTRACTION PIPELINE")
+    print("=" * 60)
+
+    start = time.perf_counter()
+    record, attempts, logs = extract_with_self_healing(noisy_input)
+    elapsed = (time.perf_counter() - start) * 1000
+
+    print("\n" + "=" * 60)
+    print("FINAL EXECUTION METRICS")
+    print("=" * 60)
+    print(f"Status:             {'SUCCESS' if record else 'FAILED'}")
+    print(f"Total Attempts:     {attempts}")
+    print(f"Total Latency:      {elapsed:.1f}ms")
+    if record:
+        print(f"Validated Routing:  {record.routing_code}")
+        print(f"Normalized Urgency: {record.urgency_score}/5")
